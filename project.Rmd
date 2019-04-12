@@ -1,0 +1,548 @@
+---
+title: "Predict a Home's Current Market Value"
+author:
+- name: Jackie
+  affiliation: University of Washington Department of Biostatistics
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: 
+        bookdown::html_document2:
+                toc: true
+                fig_caption: yes
+                fig_width: 7
+                fig_height: 4
+header-includes: 
+- \usepackage{graphicx}
+- \usepackage{float}
+- \usepackage{amsmath}
+- \usepackage{dsfont}
+- \usepackage{booktabs}
+- \usepackage{longtable}
+- \usepackage{array}
+- \usepackage{multirow}
+- \usepackage[table]{xcolor}
+- \usepackage{wrapfig}
+- \usepackage{colortbl}
+- \usepackage{pdflscape}
+- \usepackage{tabu}
+- \usepackage{threeparttable}
+- \usepackage{threeparttablex}
+- \usepackage[normalem]{ulem}
+- \usepackage{makecell}
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE, autodep=TRUE,fig.path = 'figures/', fig.pos='center')
+
+rm(list = ls())
+```
+
+```{r, include=TRUE, message=FALSE, echo=T}
+library(readr)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(tidyr)
+library(stringr)
+library(corrplot)
+library(leaflet)
+library(htmlwidgets)
+library(xtable)
+library(data.table)
+library(DT)
+library(MASS)
+library(pander)
+library(kableExtra)
+library(glmnet)
+```
+# Abstract
+The goal of the project is to predict a home's current market value. Before we built our own model, we started from exporatory data analysis based on the training set. The data analysis gave us intuitions of how houses' features correlated with each other as well as market price. The information helped us to do missing imputation and further prediction. Making a clear interpretation and displaying how features contribute to the outcome matter in the marketing. Therefore, a linear model is used as a baseline reference. However, considering of relatively large number of features, and the issue of overfitting, we further proposed LASSO to predict a home's current market value. It showed us that LASSO worked much better than linear regression in training set, and also its prediction preformed a similar pattern  in the testing set as comparing with the training set.
+
+
+# Exploratory Data Analysis
+Before predicting the home's price, we do data analysis of the training set. The reason to do so is to have a brief understanding of the data, including the statistics of features, the missing of the data, and any potential results which will help us to do final prediction. 
+
+In the trianing set, there are 11588 properties, and 24 features (including the price). For the testing, there are 4402 properties. Have peak of the training set.
+
+Notice that *censusblockgroup* and *Usecode* are only one value. Therefore, we won't consisder them as our predictors.
+
+```{r load data}
+dat_org = read_csv("Data Science ZExercise_TRAINING_CONFIDENTIAL1.csv")
+#dim(dat_org)
+
+test = read_csv("Data Science ZExercise_TEST_CONFIDENTIAL2.csv")
+#dim(test)
+```
+
+```{r DataTransform}
+dat = dat_org
+dat$TransDate = mdy(dat$TransDate)
+dat = dat %>% mutate(month = month(TransDate))
+```
+
+
+```{r, result='asis', echo=FALSE}
+datatable(head(dat_org,100), style="bootstrap", class="table-condensed", options = list(dom = 'tp',scrollX = TRUE))
+```
+
+## Missing Value
+
+We check the missing from our training set \@ref(fig:missingTrain). We can see that there is missing among *BuiltYear*,*View Type*, *Number of Bedroom*, *Finished Sqaure Feet*, *Garage Square Feet*, *Number of Story*, *BGMedHomeValue*, *BGMedRent*, and *BGMedYearBuilt* in trainging set. 
+
+### Dealing with missing
+Due the purpose of the project, we need to impute the missing. 
+
+* *View Type*. The reason for large missing in *View Type* is because the data set treats no view as missing. Therefore, we assign 0 to missing View Type.
+* *Garage Square Feet*. There are 2841 (24.52%) missing. The range (without missing) in training set is from 10 to 7504. We will assign 0 to missing value, since NA can mean there is no garage in the property.
+* *Number of Bedroom*, *Number of Story*. We treat them as ordinal variable. Ordinal logistic regression can be used to impute the missing. Details are showen in the following.
+* *BuiltYear*, *Finished Sqaure Feet*, *BuiltYear*, *BGMedHomeValue*, *BGMedRent*, and *BGMedYearBuilt*. They are continuous variable. We will use linear regression to impute the missing.
+
+
+```{r missingTrain, fig.cap="The percentage of missing for each feature in Traning set"}
+missing_values <- dat %>% summarize_each(funs(sum(is.na(.))/n()))
+#missing_values <- dat %>% summarize_each(funs(sum(is.na(.))))
+#missing_values[which(missing_values != 0)]
+missing_values <- gather(missing_values, key="feature", value="missing_pct")
+missing_values %>% 
+  ggplot(aes(x=reorder(feature,-missing_pct),y=missing_pct)) +
+  geom_bar(stat="identity",fill="red") +
+  coord_flip()+theme_bw()
+```
+```{r missingTest, fig.cap="The percentage of missing for each feature in tesing set"}
+# missing_values <- test %>% summarize_each(funs(sum(is.na(.))/n()))
+# # which features have missing
+# missing_values[which(missing_values != 0)] %>% pander
+# 
+# missing_values <- gather(missing_values, key="feature", value="missing_pct")
+# missing_values %>% 
+#   ggplot(aes(x=reorder(feature,-missing_pct),y=missing_pct)) +
+#   geom_bar(stat="identity",fill="red") +
+#   coord_flip()+theme_bw()
+```
+```{r missingView}
+dat$ViewType[which(is.na(dat$ViewType))] = 0
+```
+```{r missingGarage}
+dat$GarageSquareFeet[which(is.na(dat$GarageSquareFeet))] = 0
+```
+#### Correlation 
+```{r Variable}
+cont_var = c("month","BedroomCnt", "BathroomCnt", "FinishedSquareFeet", "GarageSquareFeet", "LotSizeSquareFeet", "StoryCnt","BuiltYear", "Latitude" ,"Longitude","BGMedHomeValue","BGMedRent","BGMedYearBuilt", "BGPctOwn","BGPctVacant", "BGMedIncome","BGPctKids","BGMedAge")
+cate_var = c("ViewType", "ZoneCodeCounty")
+dat$ViewType.f = as.factor(dat$ViewType)
+dat$ZoneCodeCounty.f = as.factor(dat$ZoneCodeCounty)
+```
+
+Before we start the imputation, we first look at the correlation plot Fig. \@ref(fig:corr). In order to keep the robustness of the model, we only use most relevant variables (correlation coefficient > 0.4 or < -0.4) as predictors to impute the missing. For example, *BathroomCnt, FinishedSquareFeet, StoryCnt, BuiltYear* are most correlated with *BedroomCnt*
+
+```{r corr, fig.cap="The corralation Plot"}
+tmp = dat[, cont_var]
+corr_cont = cor(tmp, use="complete.obs")
+corrplot(corr_cont, type="lower")
+```
+
+
+```{r data set with out missing}
+dat_nm = tmp[complete.cases(tmp),]
+```
+#### Imputation of the Number of Story and Number of Bedroom
+In the training set, the number of story ranges from 1 to 3. There is only one missing of story information, Tab. \@ref(tab:tableStory). We assume the number of stories distributed with multinomial distribution. Based on the counts, we have the empirical distributions.
+
+```{r tableStory}
+tmp = dat_nm %>% group_by(StoryCnt) %>% count()
+kable(tmp, caption = "distribution of number of bedroom")  %>%
+  kable_styling()
+```
+```{r impuationStory}
+story_pr = tmp$n/ sum(tmp$n)
+dat$StoryCnt[is.na(dat$StoryCnt)] = sample(c(1:3), size = sum(is.na(dat$StoryCnt)), prob = story_pr, replace = T)
+```
+
+In the training set, the number of bedrooms ranges from 1 to 9 Tab. \@ref(tab:tableBedroom). The number of missing is three. We use ordinal logistic regression to impute the missing
+```{r tableBedroom, results="asis"}
+kable(dat %>% group_by(BedroomCnt) %>% count(), caption = "distribution of number of bedroom")  %>%
+  kable_styling()
+```
+
+```{r Impuation Bedroom}
+bedroom_predictor = names(corr_cont["BedroomCnt",][abs(corr_cont["BedroomCnt",]) > 0.4& abs(corr_cont["BedroomCnt",]) != 1])
+
+bedroomN.olr = polr(as.factor(BedroomCnt) ~ BathroomCnt + FinishedSquareFeet, data = dat_nm, Hess = T)
+
+bedroom_miss.dat = dat %>% filter(is.na(BedroomCnt))
+dat$BedroomCnt[is.na(dat$BedroomCnt)] = predict(bedroomN.olr, bedroom_miss.dat[,bedroom_predictor]) 
+```
+
+```{r saveImputationResult}
+save(dat, file = "training_set_after_imputation.Rdata")
+
+```
+#### Imputation of the Continuous Variables
+For continuous variables, we have *BuiltYear*, *FinishedSqaureFeet*, *BGMedHomeValue*, *BGMedRent*, and *BGMedYearBuilt*. Again, we find the most relevant variables which correlate with our missing variable. Linear regressions will be used. For example, we want to impute the missing of *FinishedSqaureFeet*. First, we find the subset which does not include any missing in our training. Then we fit a linear model using *FinishedSqaureFeet* as outcome, and its relevent variables as predictors. Finally, we can predict the missing for *FinishedSqaureFeet* in our training set. Further, the same linear model will be used in the testing set to fill the missing. Note that the prediction of missing in *BGMedYearBuilt* will be rounded and belonging to the range of un-missing BGMedYearBuilt.
+```{r ImputeBuiltYear}
+BuiltYear_predictors = names(corr_cont["BuiltYear",][abs(corr_cont["BuiltYear",])>0.4 & corr_cont["BuiltYear",] != 1])
+
+BuiltYear.lm = lm(data = dat_nm,  BuiltYear ~ BathroomCnt + FinishedSquareFeet + GarageSquareFeet + BGMedYearBuilt)
+
+BuiltYear_miss.dat = dat %>% filter(is.na(BuiltYear))
+
+dat$BuiltYear[is.na(dat$BuiltYear)] = predict(BuiltYear.lm, BuiltYear_miss.dat[,BuiltYear_predictors]) 
+```
+
+```{r ImputeSqaure}
+FinishSqureFeet_predictors = names(corr_cont["FinishedSquareFeet",][abs(corr_cont["FinishedSquareFeet",])>0.4 & corr_cont["FinishedSquareFeet",] != 1])
+
+FinishSqureFeet.lm = lm(data = dat_nm,  FinishedSquareFeet ~ BedroomCnt + BathroomCnt + GarageSquareFeet + StoryCnt + BuiltYear + BGMedHomeValue)
+
+FinishedSquareFeet_miss.dat = dat %>% filter(is.na(FinishedSquareFeet))
+
+dat$FinishedSquareFeet[is.na(dat$FinishedSquareFeet)] = predict(FinishSqureFeet.lm, FinishedSquareFeet_miss.dat[,FinishSqureFeet_predictors]) 
+```
+
+```{r imputeBGMedHomeValue}
+BGMedHomeValue_predictors = names(corr_cont["BGMedHomeValue",][abs(corr_cont["BGMedHomeValue",])>0.4 & abs(corr_cont["BGMedHomeValue",]) != 1])
+BGMedHomeValue.lm = lm(BGMedHomeValue ~ FinishedSquareFeet + Latitude + BGMedRent + BGMedIncome, data = dat_nm)
+#summary(BGMedHomeValue.lm)
+BGMedHomeValue_miss.dat = dat %>% filter(is.na(BGMedHomeValue))
+
+dat$BGMedHomeValue[is.na(dat$BGMedHomeValue)] = predict(BGMedHomeValue.lm, BGMedHomeValue_miss.dat[, BGMedHomeValue_predictors])
+```
+
+```{r imputeBGMedYearBuilt}
+BGMedYearBuilt_predictors = names(corr_cont["BGMedYearBuilt",][abs(corr_cont["BGMedYearBuilt",])>0.3 & abs(corr_cont["BGMedYearBuilt",]) != 1])
+BGMedYearBuilt.lm = lm(BGMedYearBuilt ~ GarageSquareFeet + BuiltYear + Longitude + BGPctKids, data = dat_nm)
+#summary(BGMedYearBuilt.lm)
+BGMedYearBuilt_miss.dat = dat %>% filter(is.na(BGMedYearBuilt))
+
+tmp = round(predict(BGMedYearBuilt.lm, BGMedYearBuilt_miss.dat[, BGMedYearBuilt_predictors]))
+#range(tmp)
+#range(dat_nm$BGMedYearBuilt, na.rm = T)
+dat$BGMedYearBuilt[is.na(dat$BGMedYearBuilt)] = tmp
+```
+
+```{r imputeBGMedRent}
+BGMedRent_predictors = names(corr_cont["BGMedRent",][abs(corr_cont["BGMedRent",])>0.4 & abs(corr_cont["BGMedRent",]) != 1])
+
+BGMedRent.lm = lm(BGMedRent ~ BGMedHomeValue + BGPctOwn + BGMedIncome, data = dat_nm)
+#summary(BGMedRent.lm)
+BGMedRent_miss.dat = dat %>% filter(is.na(BGMedRent))
+
+dat$BGMedRent[is.na(dat$BGMedRent)] = predict(BGMedRent.lm, BGMedRent_miss.dat[, BGMedRent_predictors]) 
+```
+
+```{r}
+# removing one sample which has missing after imputation. 
+# Reason, multiple missing
+dat = dat[!is.na(dat$BedroomCnt),]
+```
+## Outcome
+First, we have a look at the outcome, price of current sale. The distribution is shown as below.
+```{r saleDensity, fig.cap="The density of price of current sale"}
+dat %>% ggplot(aes(SaleDollarCnt)) + geom_histogram(bins = 200, fill = "red") + xlab("Sale Price") + theme_bw()
+```
+### How Price Varies with Transaction Dates
+The range of transaction dates is from 04/01/2015 to 09/30/2015. We further show the distribution of transaction dates Fig. \@ref(fig:transaction).
+```{r transaction, fig.cap="The desnsity of transaction Dates"}
+dat %>% 
+  group_by(month) %>% count() %>% 
+  ggplot(aes(x=month,y=n)) + 
+        geom_bar(stat="identity", fill="red", width = 0.5) + 
+        theme_bw()
+```
+
+
+From Fig. \@ref(fig:priceVsDates), it is interesting to see that the average of price is higher during summer. 
+```{r priceVsDates, fig.cap="Mean of current sale vs. month in 2015 "}
+dat %>% group_by(month) %>% 
+        summarise(mean_price = mean(SaleDollarCnt)) %>%
+        ggplot(aes(x = month, y = mean_price)) + geom_line(size = 1.5, color = "red") + geom_point(size = 5, color = "red") + theme_bw()
+```
+
+### How Does Year of Built Change with Price
+From Fig. \@ref(fig:yearBuiltDensity), we can see most properties were built after 1960. There are not many properties which were built before 1930.
+```{r yearBuiltDensity, fig.cap="The Distribution of Build Year for the Properties"}
+dat %>% ggplot(aes(x = BuiltYear)) + geom_line(stat = "density", color = "red", size = 1.5) + theme_bw()
+```
+Next, we explore how price changes with year of built. From Fig.\@ref(fig:yearBuiltVsPrice), we can see the variation of mean price is smaller after 1960. It is because more houses which were built after 1960 were sold.
+```{r yearBuiltVsPrice, fig.cap="Mean price vs. year of built"}
+dat %>% group_by(BuiltYear) %>% 
+        summarise(mean_price = mean(SaleDollarCnt)) %>%
+        ggplot(aes(x = BuiltYear, y = mean_price)) + geom_smooth() + geom_point(size = 2, color = "red") + theme_bw()
+```
+
+### Correlation with Price
+
+#### Count Features
+```{r countFeatures, fig.cap="Correlation between Properties' Price and Count Features"}
+cor_tmp = cor(dat %>% dplyr::select(c("SaleDollarCnt",ends_with("Cnt"))))
+corrplot(cor(cor_tmp, use="complete.obs"), type = "lower")  
+```
+#### Area Features
+```{r areaFeature}
+cor_tmp = cor(dat %>% dplyr::select(c("SaleDollarCnt",contains("Square"))))
+corrplot(cor(cor_tmp, use="complete.obs"), type = "lower")  
+```
+
+#### Block Group Features
+```{r bgFeature}
+cor_tmp = cor(dat %>% dplyr::select(c("SaleDollarCnt",contains("BG"))))
+corrplot(cor(cor_tmp, use="complete.obs"), type = "lower")
+```
+
+### How does the Price Change with Location
+The map shows us that the price of current sale more correlates with latitude. Houses with higer latitude tend to have a higer saling price. 
+```{r MapPrice}
+# where are those properties, sample 2000
+lon_range = range(dat$Longitude) / 10^6
+lat_range = range(dat$Latitude) / 10^6
+
+tmp = dat %>% 
+        sample_n(2000) %>% 
+        dplyr::select(Longitude,Latitude, SaleDollarCnt) %>% 
+        mutate(lon=Longitude/1e6,lat=Latitude/1e6) %>% 
+        dplyr::select(lat,lon, SaleDollarCnt)
+
+qpal = colorQuantile("YlOrRd", tmp$SaleDollarCnt, n = 7, na.color = "#808080")
+m = leaflet(tmp) %>% 
+        addTiles() %>% 
+        fitBounds(lon_range[1],lat_range[1],lon_range[2],lat_range[2]) %>% 
+        addCircleMarkers(stroke=FALSE, color=~qpal(SaleDollarCnt),fillOpacity = 1, radius = 4) %>% 
+        addLegend("bottomright", pal = qpal, values = ~SaleDollarCnt,title = "Price of Current Sale",opacity = 1) %>% 
+        addMiniMap()
+saveWidget(m, file="where_and_days_to_sale_property.html")
+m
+```
+
+### How does the Price Change with Zone
+There are total 178 different zones. We notice that in most cases, there is only one property which belongs to some zones. If we treat all different zone codes as dummy variables in the model, the data is highly unbalanced. It also causes trouble and involves extremely inefficient estimation. As far as we know, real estate would like to hide the zone information, and buyers usually barely have knowledge of it. What buyers most care are the location, area, and etc.. Therefore, it is reasonable to discard the zone information in our prediction model. 
+```{r zone, result='asis', echo=FALSE}
+tmp = dat %>% group_by(ZoneCodeCounty.f) %>% 
+        summarise(price_mean = mean(SaleDollarCnt), n = n())
+tmp[,c(2,3)] = round(tmp[,c(2,3)])
+datatable(tmp, class="table-condensed", options = list(dom = 'tp',scrollX = TRUE))
+```
+
+# Prediction
+
+## Imputation of Missing data in Testing Set
+We will use the linear model from training set to predict the missing value in the testing set. After imputation, we take the testing set to do prediction
+
+```{r test missing View and Garage}
+test$ViewType[which(is.na(test$ViewType))] = 0
+test$GarageSquareFeet[which(is.na(test$GarageSquareFeet))] = 0
+
+test$ZoneCodeCounty.f = as.factor(test$ZoneCodeCounty)
+test$ViewType.f = as.factor(test$ViewType)
+```
+
+
+```{r test missing story}
+test$StoryCnt[is.na(test$StoryCnt)] = sample(c(1:3), size = length(is.na(test$StoryCnt)), story_pr, replace = T)
+```
+
+```{r test missing bedroom}
+test_bedroom_miss = test %>% filter(is.na(BedroomCnt))
+test$BedroomCnt[is.na(test$BedroomCnt)] = predict(bedroomN.olr, test_bedroom_miss[, bedroom_predictor])
+```
+```{r test missing BuiltYear}
+test_BuiltYear_miss = test[is.na(test$BuiltYear),]
+test$BuiltYear[is.na(test$BuiltYear)] = round(predict(BuiltYear.lm, test_BuiltYear_miss[, BuiltYear_predictors]))
+```
+
+
+```{r test missing square feet total}
+test_finishedSqureFeet = test[is.na(test$FinishedSquareFeet),]
+```
+
+```{r test missing BGMedHomeValue}
+test_BGMedHomeValue_miss = test %>% filter(is.na(BGMedHomeValue))
+test$BGMedHomeValue[is.na(test$BGMedHomeValue)] = predict(BGMedHomeValue.lm, test_BGMedHomeValue_miss[, BGMedHomeValue_predictors])
+```
+
+```{r test missing BGMedYearBuilt}
+test_BGMedYearBuilt_miss = test %>% filter(is.na(BGMedYearBuilt))
+tmp = round(predict(BGMedYearBuilt.lm, test_BGMedYearBuilt_miss[, BGMedYearBuilt_predictors]))
+test$BGMedYearBuilt[is.na(test$BGMedYearBuilt)] = tmp
+```
+
+```{r test missing BGMedRent}
+test_BGMedRent_miss = test %>% filter(is.na(BGMedRent))
+test$BGMedRent[is.na(test$BGMedRent)] = predict(BGMedRent.lm, test_BGMedRent_miss[, BGMedRent_predictors])
+```
+
+```{r testMonth}
+test$TransDate = mdy(test$TransDate)
+test = test %>% mutate(month = month(TransDate))
+```
+
+```{r checkTestAnyMissing}
+# tmp = test[, -2]
+# dim(test)
+# dim(tmp[complete.cases(tmp),])
+```
+
+```{r testSaveAfterImputation}
+save(test, file = "testing_set_after_imputation.Rdata")
+```
+
+## Models
+Our outcome is price of current sale. Potiential covariates include *ViewType, BedroomCnt, BathroomCnt, StoryCnt, FinishedSquareFeet, GarageSquareFeet , LotSizeSquareFeet, BuiltYear, month, Latitude, Longitude, BGMedHomeValue, BGMedRent, BGMedYearBuilt, BGPctOwn, BGPctVacant, BGMedIncome, BGPctKids, BGMedAge*
+
+We start from a baseline model, linear regression. 
+
+Next, we use LASSO to do prediction. The power of the method is that it can fix overfitting problems and also help variable selection. It involves a  parameter $\lambda$. Cross-validation will be used to select the optimal $\lambda$. 
+
+
+### Linear Model, A Baseline Reference
+Seven-fold cross validation is performed. By doing this, we can check if the model's prediction accuracy isn't varying too much for any one particular sample, and if the lines of best fit don’t vary too much with respect the the slope and level. 
+
+```{r trainCV}
+# remove ViewType = 247
+train = dat %>% dplyr::filter(ViewType != 247)
+train_241 = dat %>% dplyr::filter(ViewType == 241)
+
+set.seed(16)
+
+cv_k = 7
+index_resample = sample(c(1:nrow(test)), size = nrow(test))
+
+length_cv = round(length(index_resample)/cv_k)
+
+lm_train_r2 = rep(0, cv_k)
+lm_train_aape = rep(0, cv_k)
+
+lm_cv_aape = rep(0, cv_k)
+for(i in 1:cv_k){
+        cv_index = index_resample[(length_cv * (i-1)+1): (length_cv * i)]
+        train_index = index_resample[!index_resample %in% cv_index]
+        
+        train_i = dat[train_index, ]
+        cv_i = dat[cv_index, ]
+        
+        if(sum(train_i$ViewType==241)==0){
+                train_i = rbind(train_i, train_241)
+        }
+        
+        tmp.lm =  lm(data = train_i, SaleDollarCnt ~ ViewType.f + 
+                      BedroomCnt + BathroomCnt + StoryCnt + 
+                      FinishedSquareFeet + GarageSquareFeet + LotSizeSquareFeet + 
+                      BuiltYear + month +
+                      Latitude + Longitude +
+                      BGMedHomeValue + BGMedRent + BGMedYearBuilt + BGPctOwn + BGPctVacant + BGMedIncome + BGPctKids + BGMedAge)
+        
+        
+        lm_train_aape[i] = mean(abs(tmp.lm$residuals)/train_i$SaleDollarCnt)
+        
+        # prediction
+        cv_y = predict(tmp.lm, dplyr::select(cv_i, ViewType.f, 
+                      BedroomCnt , BathroomCnt , StoryCnt, 
+                      FinishedSquareFeet , GarageSquareFeet , LotSizeSquareFeet , 
+                      BuiltYear , month ,
+                      Latitude , Longitude ,
+                      BGMedHomeValue , BGMedRent , BGMedYearBuilt , BGPctOwn , BGPctVacant , BGMedIncome , BGPctKids , BGMedAge))
+        
+        lm_cv_aape[i] = mean(abs(cv_i$SaleDollarCnt-cv_y)/cv_i$SaleDollarCnt)
+}
+```
+
+```{r plotLmMSE, fig.cap="Sqrt of MSE of 4 fold Cross-Validation for Baseline Model"}
+tmp.df = data.frame(x = rep(c(1: cv_k),2), AAPE = sqrt(c(lm_cv_aape, lm_train_aape)), Type = rep(c("CV", "Train"), each = cv_k))
+
+tmp.df %>% ggplot(aes(x = x, y = AAPE, color = Type)) +
+        geom_line() + geom_point() + theme_bw()
+```
+
+### LASSO
+The loss function for LASSO is 
+$$ L = \frac{1}{n}\|Y-X\beta\|_2^2 + \lambda \|\beta\|_1.$$ We have $\hat \beta$ estimated by minimize the loss function. 
+
+Fisrt, we perform a grid search to find the optimal value of $\lambda$ by using 7-fold cross validation. The loss to use for cross-validation is squarred-error. The plot is shown in Fig. \@ref(fig:lassoCV).
+```{r lassoCV, fig.cap="Error as a function of lambda (select lambda that minimises error)"}
+train = dat %>% filter(ViewType != 247)
+train$ViewType.f = as.factor(train$ViewType)
+
+tmp = dplyr::select(train, SaleDollarCnt, ViewType.f, 
+                      BedroomCnt , BathroomCnt , StoryCnt, 
+                      FinishedSquareFeet, GarageSquareFeet, LotSizeSquareFeet ,
+                      BuiltYear , month ,
+                      Latitude , Longitude ,
+                      BGMedHomeValue , BGMedRent , BGMedYearBuilt , BGPctOwn , BGPctVacant , BGMedIncome , BGPctKids , BGMedAge)
+
+# tmp = dplyr::select(dat, ZoneCodeCounty.f, SaleDollarCnt, ViewType.f, 
+#                       BedroomCnt , BathroomCnt , StoryCnt, 
+#                       FinishedSquareFeet , GarageSquareFeet , LotSizeSquareFeet , 
+#                       BuiltYear , month ,
+#                       Latitude , Longitude ,
+#                       BGMedHomeValue , BGMedRent , BGMedYearBuilt , BGPctOwn , BGPctVacant , BGMedIncome , BGPctKids , BGMedAge)
+
+x = model.matrix(SaleDollarCnt ~., tmp)
+y_train = tmp$SaleDollarCnt
+
+#perform grid search to find optimal value of lambda
+set.seed(17)
+cv.out = cv.glmnet(x,y_train,alpha=1,type.measure = "mse", nfolds = 7)
+#plot result
+plot(cv.out)
+```
+
+The optimal $\lambda$ is 27771, which will be further used to predict the price of current sale in the testing set. Average Absolute Percent Error (AAPE) for training set is 0.228. Compare it with AAPE after using linear regression in Fig \@ref(fig:plotLmMSE), we can see it is half smaller. LASSO does give us a better prediction.  Feature selections are shown in the following.
+
+```{r lassoCoef}
+lambda_1se <- cv.out$lambda.1se
+
+#regression coefficients
+lasso_coef = coef(cv.out,s=lambda_1se,exact=TRUE)
+
+inds<-which(lasso_coef!=0)
+variables<-row.names(lasso_coef)[inds]
+coef_nonzero = lasso_coef[lasso_coef!=0]
+
+kable(cbind(variables, coef_nonzero), caption = "Estimation Results for LASSO") %>%
+        kable_styling()
+```
+
+```{r LassoTrainingError}
+y_train_est = predict(cv.out, newx = x, s = lambda_1se, type = "response")
+train_aape = mean(abs(train$SaleDollarCnt - y_train_est)/train$SaleDollarCnt)
+```
+
+
+```{r LASSOpredict}
+tmp =  dplyr::select(test, SaleDollarCnt, ViewType.f, 
+                      BedroomCnt , BathroomCnt , StoryCnt, 
+                      FinishedSquareFeet , GarageSquareFeet , LotSizeSquareFeet , 
+                      BuiltYear , month ,
+                      Latitude , Longitude ,
+                      BGMedHomeValue , BGMedRent , BGMedYearBuilt , BGPctOwn , BGPctVacant , BGMedIncome , BGPctKids , BGMedAge)
+tmp$SaleDollarCnt = rep(0, nrow(tmp))
+
+x_test = model.matrix(SaleDollarCnt ~., tmp)
+
+y_test = predict(cv.out,newx = x_test, s=lambda_1se,type="response")
+y_test[y_test < min(dat$SaleDollarCnt)] = min(dat$SaleDollarCnt)
+
+test$SaleDollarCnt = y_test
+rst = test %>% dplyr::select(PropertyID, SaleDollarCnt)
+
+write.csv(rst, "prediction_rst.csv")
+```
+
+Finally, we use our LASSO model on testing site. Prediction results are saved in **prediction_rst.csv**. The distribution of prediction is shown in Fig. \@ref(fig:TestsaleDensity) as below. We further plot the properties' price and location in the testing set.
+```{r TestsaleDensity, fig.cap="The density of predicted price of current sale"}
+test %>% ggplot(aes(SaleDollarCnt)) + geom_histogram(bins = 200, fill = "red") + xlab("Sale Price") + xlim(c(0, 8*10^6)) + theme_bw()
+```
+
+```{r whereTestVSprice}
+tmp = test %>% 
+        dplyr::select(Longitude,Latitude, SaleDollarCnt) %>% 
+        mutate(lon=Longitude/1e6,lat=Latitude/1e6) %>% 
+        dplyr::select(lat,lon, SaleDollarCnt)
+
+qpal = colorQuantile("YlOrRd", tmp$SaleDollarCnt, n = 7, na.color = "#808080")
+mt = leaflet(tmp) %>% 
+        addTiles() %>% 
+        fitBounds(lon_range[1],lat_range[1],lon_range[2],lat_range[2]) %>% 
+        addCircleMarkers(stroke=FALSE, color=~qpal(SaleDollarCnt),fillOpacity = 1, radius = 4) %>% 
+        addLegend("bottomright", pal = qpal, values = ~SaleDollarCnt,title = "Prediction Price of Current Sale",opacity = 1) %>% 
+        addMiniMap()
+saveWidget(mt, file="where_and_days_to_sale_property_test.html")
+mt
+```
